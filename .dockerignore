@@ -1,0 +1,64 @@
+# Version control
+.git
+.gitignore
+
+# Documentation
+*.md
+docs/
+
+# Tests and coverage
+tests/
+htmlcov/
+.coverage
+.pytest_cache/
+junit.xml
+coverage.xml
+
+# Development files
+.env*
+env.example
+requirements-dev.txt
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# GitHub workflows (not needed in container)
+.github/
+
+# Security and DevOps files
+SECURITY.md
+DEVSECOPS_STRATEGY.md
+.safety-policy.yml
+
+# Scripts
+docker-build.sh
+run.py
+
+# Configuration files
+pytest.ini

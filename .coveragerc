@@ -1,0 +1,36 @@
+# Configuração do coverage para FastAPI Healthy
+
+[run]
+source = app
+omit = 
+    */tests/*
+    */venv/*
+    */__pycache__/*
+    */migrations/*
+    manage.py
+    setup.py
+    */settings/local.py
+
+[report]
+# Configurações de relatório
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise AssertionError
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    if TYPE_CHECKING:
+
+# Precisão decimal para percentuais
+precision = 2
+
+# Mostrar linhas faltantes
+show_missing = True
+
+# Ordenar por cobertura
+sort = Cover
+
+[html]
+# Configurações do relatório HTML
+directory = htmlcov
+title = FastAPI Healthy Coverage Report

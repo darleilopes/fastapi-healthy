@@ -1,0 +1,32 @@
+[bandit]
+# Bandit configuration for FastAPI Healthy
+
+# Exclude test files and generated code
+exclude_dirs = [
+    "tests",
+    "venv",
+    ".venv", 
+    "htmlcov",
+    ".pytest_cache"
+]
+
+# Skipped tests (by test ID)
+skips = [
+    "B101",  # Skip assert_used - we use asserts in tests
+    "B601"   # Skip shell injection for known safe cases
+]
+
+# Confidence levels: HIGH, MEDIUM, LOW
+confidence = ["HIGH", "MEDIUM"]
+
+# Severity levels: HIGH, MEDIUM, LOW  
+severity = ["HIGH", "MEDIUM"]
+
+# Report format: json, csv, txt, html, xml
+format = "json"
+
+# Include full path in the report
+full_path = true
+
+# Aggregate results by file
+aggregate = "file"

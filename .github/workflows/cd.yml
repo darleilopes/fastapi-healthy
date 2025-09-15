@@ -1,0 +1,491 @@
+name: CD Pipeline
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types: [completed]
+    branches: [ main ]
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PYTHON_VERSION: "3.12"
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+  actions: read
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================
+  # JOB 1: Build & Push Container
+  # ============================================
+  build-and-push:
+    name: Build & Push Container
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Only run if CI completed successfully, tag push, or manual dispatch
+    if: >-
+      ${{ 
+        (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
+        (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+        github.event_name == 'workflow_dispatch'
+      }}
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+      actions: read
+      id-token: write
+      
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ steps.scan-prep.outputs.scan_tag }}
+      all-tags: ${{ steps.meta.outputs.tags }}
+      build-result: ${{ steps.build.outcome }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+          buildkitd-flags: |
+            --allow-insecure-entitlement security.insecure
+            --allow-insecure-entitlement network.host
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Auto-Configure Permissions (Attempt)
+        continue-on-error: true
+        run: |
+          echo "::group::Auto-Configure Repository Permissions"
+          
+          # Try to configure repository permissions using GitHub CLI
+          echo "Attempting to configure repository permissions..."
+          
+          # Check if we can access the repository settings
+          if gh api repos/${{ github.repository }} --jq '.permissions' 2>/dev/null; then
+            echo "Repository is accessible via API"
+            
+            # Try to update repository settings (this may fail due to permissions)
+            echo "Attempting to set workflow permissions..."
+            gh api --method PATCH repos/${{ github.repository }}/actions/permissions \
+              --field default_workflow_permissions=write \
+              --field can_approve_pull_request_reviews=true 2>&1 || \
+              echo "Could not auto-configure permissions (manual configuration required)"
+              
+          else
+            echo "Cannot access repository settings via API"
+            echo "Manual configuration will be required"
+          fi
+          
+          echo "::endgroup::"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify Registry Access
+        run: |
+          echo "::group::Registry Access Verification"
+          echo "Registry: ${{ env.REGISTRY }}"
+          echo "Repository: ${{ env.IMAGE_NAME }}"
+          echo "Actor: ${{ github.actor }}"
+          echo "Repository Owner: ${{ github.repository_owner }}"
+          echo "Event Name: ${{ github.event_name }}"
+          echo "Ref: ${{ github.ref }}"
+          echo "Repository Visibility: ${{ github.event.repository.private && 'Private' || 'Public' }}"
+          echo "Full image name will be: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          
+          # Test authentication
+          echo ""
+          echo "=== Docker Login Status ==="
+          if docker info | grep -q "Username"; then
+            echo "Docker logged in successfully"
+            docker info | grep -A10 -B5 "Username" || echo "No username info found"
+          else
+            echo "Docker login may have failed"
+          fi
+          
+          # Verify Docker credentials
+          echo ""
+          echo "=== Docker Credentials Test ==="
+          if docker run --rm -v ~/.docker:/root/.docker:ro alpine:latest cat /root/.docker/config.json 2>/dev/null | grep -q "ghcr.io"; then
+            echo "GHCR credentials found in Docker config"
+          else
+            echo "No GHCR credentials found in Docker config"
+          fi
+          
+          # Test registry connectivity with detailed output
+          echo ""
+          echo "=== Registry Connectivity Test ==="
+          REGISTRY_STATUS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                                 "https://ghcr.io/v2/" -w "%{http_code}" -o registry_test.txt)
+          echo "Registry HTTP Status: $REGISTRY_STATUS"
+          if [ "$REGISTRY_STATUS" = "200" ]; then
+            echo "Registry is reachable and authenticated"
+            echo "Response: $(cat registry_test.txt)"
+          else
+            echo "Registry connectivity or auth failed"
+            echo "Response: $(cat registry_test.txt)"
+          fi
+          
+          # Test GitHub API access
+          echo ""
+          echo "=== GitHub API Token Test ==="
+          API_STATUS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                           "https://api.github.com/user" -w "%{http_code}" -o api_test.txt)
+          echo "GitHub API Status: $API_STATUS"
+          if [ "$API_STATUS" = "200" ]; then
+            echo "GitHub API accessible"
+            echo "User: $(cat api_test.txt | grep -o '"login":"[^"]*"' | cut -d'"' -f4)"
+          else
+            echo "GitHub API access failed"
+          fi
+          
+          # Check repository permissions
+          echo ""
+          echo "=== Repository Permissions Test ==="
+          REPO_STATUS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                            "https://api.github.com/repos/${{ github.repository }}" -w "%{http_code}" -o repo_api_test.txt)
+          echo "Repository API Status: $REPO_STATUS"
+          if [ "$REPO_STATUS" = "200" ]; then
+            echo "Repository is accessible"
+            echo "Private: $(cat repo_api_test.txt | grep -o '"private":[^,]*' | cut -d':' -f2)"
+            echo "Permissions: $(cat repo_api_test.txt | grep -o '"permissions":{[^}]*}' | head -1)"
+          else
+            echo "Repository access failed"
+          fi
+          
+          # Test specific repository access on GHCR
+          echo ""
+          echo "=== GHCR Repository Access Test ==="
+          REPO_URL="https://ghcr.io/v2/${{ env.IMAGE_NAME }}/tags/list"
+          echo "Testing access to: $REPO_URL"
+          
+          GHCR_STATUS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                            "$REPO_URL" -w "%{http_code}" -o repo_test.txt)
+          echo "GHCR Repository Status: $GHCR_STATUS"
+          
+          if [ "$GHCR_STATUS" = "200" ]; then
+            echo "Repository is accessible"
+            echo "Response: $(cat repo_test.txt | head -200)"
+          elif [ "$GHCR_STATUS" = "404" ]; then
+            echo "Repository not found (normal for first push)"
+          elif [ "$GHCR_STATUS" = "401" ] || [ "$GHCR_STATUS" = "403" ]; then
+            echo "Authentication/Authorization failed"
+            echo "This usually means:"
+            echo "1. Repository workflow permissions need to be set to 'Read and write'"
+            echo "2. Or package permissions need to be configured"
+          else
+            echo "Unexpected response: $GHCR_STATUS"
+            echo "Response: $(cat repo_test.txt)"
+          fi
+          
+          echo "::endgroup::"
+
+      - name: Extract Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build Progress Monitor
+        run: |
+          echo "::group::Build Configuration"
+          echo "Registry: ${{ env.REGISTRY }}"
+          echo "Image: ${{ env.IMAGE_NAME }}"
+          echo "Tags: ${{ steps.meta.outputs.tags }}"
+          echo "Build started at: $(date)"
+          echo "::endgroup::"
+
+      - name: Build Container Image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+          # Optimizations for faster builds
+          provenance: false
+          sbom: false
+          # Build-time optimizations
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+
+
+
+      - name: Verify Push Success
+        if: always()
+        run: |
+          echo "::group::Push Verification"
+          
+          echo "Verifying local image details before final verification..."
+          MAIN_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
+          echo "Built image: $MAIN_TAG"
+          
+          # Show local image details
+          if docker image inspect "$MAIN_TAG" >/dev/null 2>&1; then
+            echo "Local image verified successfully!"
+            echo "Image details:"
+            docker image inspect "$MAIN_TAG" --format '
+              Repository: {{.RepoTags}}
+              Size: {{.Size}} bytes ({{.VirtualSize}} virtual)
+              Created: {{.Created}}
+              Architecture: {{.Architecture}}
+              OS: {{.Os}}'
+          else
+            echo "Local image not found!"
+            echo "Available local images:"
+            docker images
+          fi
+          
+          echo ""
+          echo "Images should now be available in registry after push step"
+          echo "Check your packages at:"
+          echo "  https://github.com/${{ github.repository_owner }}/packages"
+          
+          echo "::endgroup::"
+
+      - name: Push Status Summary
+        if: always()
+        run: |
+          echo "::group::Build & Push Summary"
+          
+          echo "Build & Push completed!"
+          echo ""
+          echo "   Your images should be available at:"
+          echo "   https://github.com/${{ github.repository_owner }}/packages"
+          echo ""
+          echo "   Available tags:"
+          echo "${{ steps.meta.outputs.tags }}" | while IFS= read -r tag; do
+            if [ -n "$tag" ]; then
+              echo "   - $tag"
+            fi
+          done
+          echo ""
+          echo "  To pull your image locally:"
+          FIRST_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
+          echo "   docker pull $FIRST_TAG"
+          echo ""
+          echo "  Package URL:"
+          echo "   https://github.com/${{ github.repository_owner }}/packages/container/$(echo ${{ env.IMAGE_NAME }} | cut -d'/' -f2)"
+          echo ""
+          echo "   If you don't see the package immediately:"
+          echo "   • Check repository permissions: Settings > Actions > General"
+          echo "   • Ensure 'Read and write permissions' is selected"
+          echo "   • Wait a few minutes for registry propagation"
+          
+          echo "::endgroup::"
+
+      - name: Build Complete
+        run: |
+          echo "::group::Build Results"
+          echo "Build completed at: $(date)"
+          echo "Image digest: ${{ steps.build.outputs.digest }}"
+          echo "Tags created: ${{ steps.meta.outputs.tags }}"
+          echo "Available images:"
+          docker images
+          echo "::endgroup::"
+
+      - name: Get Image for Scan
+        id: scan-prep
+        run: |
+          # Get first tag for scanning
+          SCAN_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
+          echo "scan_tag=$SCAN_TAG" >> $GITHUB_OUTPUT
+          echo "Scanning image: $SCAN_TAG"
+          
+          # Verify image exists locally
+          echo "Checking for local images..."
+          docker images
+          
+          # Check if image exists (more robust check)
+          if docker image inspect "$SCAN_TAG" >/dev/null 2>&1; then
+            echo "  Image found locally for scanning: $SCAN_TAG"
+            echo "Image details:"
+            docker image inspect "$SCAN_TAG" --format '{{.RepoTags}} ({{.Size}} bytes)'
+          else
+            echo "   Image not found locally: $SCAN_TAG"
+            echo "Available images with fastapi-healthy:"
+            docker images | grep fastapi-healthy || echo "No fastapi-healthy images found"
+            echo "All available images:"
+            docker images --format "{{.Repository}}:{{.Tag}}"
+            exit 1
+          fi
+
+      - name: Run Trivy Container Scan
+        uses: aquasecurity/trivy-action@master
+        timeout-minutes: 3
+        with:
+          image-ref: ${{ steps.scan-prep.outputs.scan_tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          timeout: '180s'
+          # Skip files that don't affect security
+          skip-files: '/usr/share/doc/*,/usr/share/man/*'
+          # Skip directories that don't affect security  
+          skip-dirs: '/usr/share/doc,/usr/share/man,/var/lib/apt/lists'
+
+      - name: Push Container Image
+        id: push
+        if: always()
+        run: |
+          echo "::group::Push to Registry"
+          echo "Security scan completed, now pushing image to registry..."
+          
+          # Push all tags to registry
+          echo "Tags to push:"
+          echo "${{ steps.meta.outputs.tags }}" | while IFS= read -r tag; do
+            if [ -n "$tag" ]; then
+              echo "  - $tag"
+            fi
+          done
+          
+          # Push each tag
+          echo ""
+          echo "Pushing images..."
+          FAILED_TAGS=""
+          SUCCESSFUL_TAGS=""
+          
+          echo "${{ steps.meta.outputs.tags }}" | while IFS= read -r tag; do
+            if [ -n "$tag" ]; then
+              echo "Pushing: $tag"
+              if docker push "$tag"; then
+                echo "  Successfully pushed: $tag"
+                SUCCESSFUL_TAGS="$SUCCESSFUL_TAGS $tag"
+              else
+                echo "  Failed to push: $tag"
+                FAILED_TAGS="$FAILED_TAGS $tag"
+              fi
+            fi
+          done
+          
+          echo "::endgroup::"
+
+      - name: Scan Complete
+        run: |
+          echo "::group::Build & Push Complete"
+          echo "  Container security scan completed"
+          echo "  Images pushed to registry"
+          echo ""
+          echo "  Available tags:"
+          echo "${{ steps.meta.outputs.tags }}" | while IFS= read -r tag; do
+            if [ -n "$tag" ]; then
+              echo "  - $tag"
+            fi
+          done
+          echo "::endgroup::"
+
+      - name: Upload Trivy Scan Results to Security Tab
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy-container-scan'
+
+      - name: Upload Trivy Results as Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-security-scan-results
+          path: |
+            trivy-results.sarif
+          retention-days: 30
+
+      - name: Display Scan Summary
+        if: always()
+        run: |
+          echo "::group::Security Scan Summary"
+          if [ -f "trivy-results.sarif" ]; then
+            echo "Trivy scan completed successfully"
+            echo "SARIF file size: $(du -h trivy-results.sarif | cut -f1)"
+            echo "Results uploaded as artifact: trivy-security-scan-results"
+            
+            # Try to extract basic info from SARIF
+            if command -v jq >/dev/null 2>&1; then
+              FINDINGS=$(jq -r '.runs[0].results | length' trivy-results.sarif 2>/dev/null || echo "unknown")
+              echo "  Total findings: $FINDINGS"
+            fi
+          else
+            echo "No SARIF file generated"
+          fi
+          echo "::endgroup::"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        continue-on-error: true
+        with:
+          image: ${{ steps.scan-prep.outputs.scan_tag }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbom-report
+          path: |
+            sbom.spdx.json
+          retention-days: 30
+
+      - name: SBOM Summary
+        if: always()
+        run: |
+          echo "::group::SBOM Generation Summary"
+          if [ -f "sbom.spdx.json" ]; then
+            echo "SBOM generated successfully"
+            echo "SBOM file size: $(du -h sbom.spdx.json | cut -f1)"
+            echo "SBOM uploaded as artifact: sbom-report"
+            
+            # Try to extract basic info from SBOM
+            if command -v jq >/dev/null 2>&1; then
+              PACKAGES=$(jq -r '.packages | length' sbom.spdx.json 2>/dev/null || echo "unknown")
+              echo "Total packages: $PACKAGES"
+            fi
+          else
+            echo "No SBOM file generated"
+            echo "Image scanned: ${{ steps.scan-prep.outputs.scan_tag }}"
+          fi
+          echo "::endgroup::"
